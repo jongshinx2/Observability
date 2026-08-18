@@ -1,0 +1,18 @@
+prometheus:
+  description: "시계열 메트릭 데이터베이스"
+  promql_rules:
+    - "기본 상태 조회: up 또는 up{job='prometheus'}"
+    - "비교 연산자: 값이 0인지 비교할 때는 반드시 '==' 사용 (예: up == 0)"
+    - "금지 키워드: since(), duration(), %, 단일 '=' 연산자 사용 금지"
+  examples:
+    - query: "up"
+      description: "모든 대상의 가동 상태 조회"
+    - query: "up{job='prometheus'}"
+      description: "prometheus job의 상태 조회"
+    - query: "up == 0"
+      description: "다운된 대상만 조회"
+
+loki:
+  description: "로그 데이터베이스"
+  examples:
+    - query: '{job="prometheus"}'
