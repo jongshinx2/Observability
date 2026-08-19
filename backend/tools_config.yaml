@@ -1,0 +1,46 @@
+tools:
+  - type: "function"
+    function:
+      name: "query_prometheus"
+      description: "Prometheus 시계열 메트릭 조회. 반드시 메트릭 이름을 먼저 쓰고 라벨은 뒤의 중괄호 안에 작성한다. 올바름: 'http_requests_total{service_name=\"payment-api\"}'. 잘못됨: 'service_name=\"payment-api\" | http_requests_total'. PromQL에서는 파이프 '|', 'since', 'duration', 단일 '=' 사용 금지."
+      parameters:
+        type: "object"
+        properties:
+          promql:
+            type: "string"
+            description: "실행할 표준 PromQL 쿼리문 (예: 'up{job=\"otel-collector\"}', 'http_requests_total{service_name=\"payment-api\"}')"
+            minLength: 1
+            maxLength: 2000
+        required: ["promql"]
+
+  - type: "function"
+    function:
+      name: "query_loki"
+      description: "Loki 로그 데이터 조회. LogQL은 반드시 '{...}' 스트림 selector로 시작하며 파이프 '|'는 이 도구에서만 사용할 수 있다."
+      parameters:
+        type: "object"
+        properties:
+          logql:
+            type: "string"
+            description: "LogQL 쿼리문 (예: '{service_name=\"payment-api\"}', '{service_name=\"payment-api\"} | detected_level=\"error\"')"
+            minLength: 1
+            maxLength: 2000
+          limit:
+            type: "integer"
+            default: 10
+            minimum: 1
+            maximum: 1000
+        required: ["logql"]
+
+  - type: "function"
+    function:
+      name: "query_tempo"
+      description: "Tempo 분산 트레이싱 데이터 조회. 특정 Trace ID의 호출 트리, 소요 시간, 스팬 에러 여부를 확인할 때 사용."
+      parameters:
+        type: "object"
+        properties:
+          trace_id:
+            type: "string"
+            description: "조회할 32자리 hex Trace ID"
+            pattern: "^[0-9a-fA-F]{32}$"
+        required: ["trace_id"]

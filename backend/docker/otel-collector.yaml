@@ -10,6 +10,10 @@ processors:
 exporters:
   prometheus:
     endpoint: "0.0.0.0:8889"
+    resource_to_telemetry_conversion:
+      enabled: true
+  otlp_http/loki:
+    endpoint: "http://loki:3100/otlp"
   otlp/tempo:
     endpoint: "tempo:4317"
     tls:
@@ -17,6 +21,10 @@ exporters:
 
 service:
   pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_http/loki]
     traces:
       receivers: [otlp]
       processors: [batch]

@@ -1,0 +1,83 @@
+<div style="display: flex; flex-direction: column; height: 100%; font-family: sans-serif;">
+  <!-- 대화 내용 영역 -->
+  <div id="srelens-chat-box" style="flex: 1; min-height: 280px; max-height: 450px; overflow-y: auto; background-color: #181b1f; border: 1px solid #333; padding: 12px; border-radius: 4px; margin-bottom: 10px;">
+    <p style="color: #8e8e8e; margin: 0 0 10px 0;">🤖 <b>SRELens:</b> 관측성 데이터에 대해 자연어로 질문해 주세요.</p>
+  </div>
+  
+  <!-- 질문 입력 영역 -->
+  <div style="display: flex; gap: 8px;">
+    <input type="text" id="srelens-input" placeholder="예: prometheus 상태 확인해줘" style="flex: 1; background: #22252b; border: 1px solid #333; color: #fff; padding: 8px 12px; border-radius: 4px;" onkeypress="if(event.key==='Enter') sendSRELensQuery()" />
+    <button onclick="sendSRELensQuery()" style="background: #3274d9; color: #fff; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer;">전송</button>
+  </div>
+</div>
+
+<script>
+const SRELENS_API_URL = 'http://localhost:8000/api/chat';
+
+function appendSRELensMessage(chatBox, icon, label, message, color = '') {
+  const row = document.createElement('div');
+  row.style.marginBottom = '10px';
+  row.style.whiteSpace = 'pre-wrap';
+
+  if (color) {
+    row.style.color = color;
+  }
+
+  if (icon) {
+    row.appendChild(document.createTextNode(`${icon} `));
+  }
+
+  const labelElement = document.createElement('b');
+  labelElement.textContent = `${label}:`;
+  row.appendChild(labelElement);
+  row.appendChild(document.createTextNode(` ${String(message ?? '')}`));
+  chatBox.appendChild(row);
+
+  return row;
+}
+
+async function sendSRELensQuery() {
+  const input = document.getElementById('srelens-input');
+  const chatBox = document.getElementById('srelens-chat-box');
+  const query = input.value.trim();
+  
+  if (!query) return;
+
+  // 1. 사용자 질문 화면에 추가
+  appendSRELensMessage(chatBox, '', 'User', query);
+  input.value = '';
+  chatBox.scrollTop = chatBox.scrollHeight;
+
+  // 2. 로딩 상태 표시
+  const loadingMessage = appendSRELensMessage(chatBox, '🤖', 'SRELens', '분석 중...', '#8e8e8e');
+  chatBox.scrollTop = chatBox.scrollHeight;
+
+  try {
+    // 3. FastAPI 백엔드 호출
+    const response = await fetch(SRELENS_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: query, user_context: "" })
+    });
+
+    const data = await response.json();
+    loadingMessage.remove();
+
+    if (response.ok) {
+      appendSRELensMessage(chatBox, '🤖', 'SRELens', data.reply);
+    } else {
+      appendSRELensMessage(chatBox, '⚠️', 'Error', data.detail || '분석 오류 발생', '#f2495c');
+    }
+  } catch (err) {
+    loadingMessage.remove();
+    appendSRELensMessage(
+      chatBox,
+      '⚠️',
+      'Connection Error',
+      `FastAPI 백엔드(${SRELENS_API_URL}) 통신 실패`,
+      '#f2495c'
+    );
+  }
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
+</script>

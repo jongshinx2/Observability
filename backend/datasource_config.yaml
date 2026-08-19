@@ -1,18 +1,35 @@
 prometheus:
   description: "시계열 메트릭 데이터베이스"
   promql_rules:
-    - "기본 상태 조회: up 또는 up{job='prometheus'}"
+    - "수집 경로 상태 조회: up 또는 up{job='otel-collector'}"
+    - "서비스 상태 분석: up만으로 애플리케이션 상태를 단정하지 말고 service_name 라벨이 있는 애플리케이션 메트릭을 함께 확인"
+    - "라벨 selector는 반드시 메트릭 이름 뒤의 중괄호 안에 작성: http_requests_total{service_name='payment-api'}"
+    - "PromQL에서는 LogQL 파이프 문자 | 사용 금지"
     - "비교 연산자: 값이 0인지 비교할 때는 반드시 '==' 사용 (예: up == 0)"
     - "금지 키워드: since(), duration(), %, 단일 '=' 연산자 사용 금지"
   examples:
     - query: "up"
       description: "모든 대상의 가동 상태 조회"
-    - query: "up{job='prometheus'}"
-      description: "prometheus job의 상태 조회"
+    - query: "up{job='otel-collector'}"
+      description: "OpenTelemetry Collector의 Prometheus 수집 경로 상태 조회"
+    - query: 'http_requests_total{service_name="payment-api"}'
+      description: "payment-api 서비스의 누적 HTTP 요청 수 조회"
     - query: "up == 0"
       description: "다운된 대상만 조회"
 
 loki:
   description: "로그 데이터베이스"
+  logql_rules:
+    - "로그 쿼리는 반드시 {service_name='...'} 형태의 스트림 selector로 시작"
+    - "파이프 문자 | 는 Loki LogQL에서만 사용"
   examples:
-    - query: '{job="prometheus"}'
+    - query: '{service_name="payment-api"}'
+      description: "payment-api 서비스의 OpenTelemetry 로그 조회"
+    - query: '{service_name="payment-api"} | detected_level="error"'
+      description: "payment-api 서비스의 에러 로그 조회"
+
+tempo:
+  description: "분산 트레이싱 데이터베이스 (서비스 간 호출 및 소요 시간 추적)"
+  usage: "특정 Trace ID를 이용해 호출 스팬(Span) 및 에러 발생 지점 추적"
+  examples:
+    - trace_id: "32자리 hex 문자열 (예: 4f2a71b...)"
