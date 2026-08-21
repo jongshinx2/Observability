@@ -1,0 +1,11 @@
+description: Prometheus 시계열 메트릭 데이터베이스
+rules:
+  - 메트릭 이름을 먼저 쓰고 라벨 selector는 바로 뒤 중괄호 안에 작성
+  - 비교에는 단일 등호가 아니라 이중 등호 사용
+  - 파이프 문자를 사용하지 않음
+  - 존재하지 않는 함수나 문법을 만들지 않음
+examples:
+  - intent: OpenTelemetry Collector 수집 상태
+    query: 'up{job="otel-collector"}'
+  - intent: payment-api 누적 요청 수
+    query: 'http_requests_total{service_name="payment-api"}'

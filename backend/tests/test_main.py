@@ -3,178 +3,363 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
+from pydantic import ValidationError
+
 from backend import main
+from backend.agent.orchestrator import Orchestrator
+from backend.agent.synthesizer import Synthesizer
+from backend.agent.workflow import SREWorkflow
+from backend.config.settings import DATASOURCE_DIR, PROMPTS_DIR, load_datasource_config
+from backend.generators.loki import LokiQueryGenerator
+from backend.generators.prometheus import PrometheusQueryGenerator
+from backend.models import (
+    Datasource,
+    GeneratedQuery,
+    InvestigationPlan,
+    InvestigationStep,
+    ResultStatus,
+    ToolResult,
+    WorkflowOutcome,
+)
+from backend.tools.loki import LokiQuery
+from backend.tools.prometheus import PrometheusQuery, PrometheusTool
+from backend.tools.tempo import TempoQuery
+from backend.tools.base import describe_exception
 
 
-class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_mixed_logql_syntax_is_rejected_before_prometheus_call(self):
-        handler = AsyncMock(return_value="should not be called")
+def function_call_response(name: str, arguments: dict):
+    call = SimpleNamespace(
+        function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+    )
+    message = SimpleNamespace(tool_calls=[call], content=None)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
-        with patch.dict(
-            main.TOOL_HANDLERS,
-            {"query_prometheus": (main.PrometheusToolArgs, handler)},
-        ):
-            result = await main.execute_tool(
-                "query_prometheus",
-                '{"promql":"service_name=\\"payment-api\\" | http_requests_total"}',
+
+class ContractTests(unittest.TestCase):
+    def test_orchestrator_step_cannot_contain_raw_query_fields(self):
+        fields = InvestigationStep.model_fields
+
+        self.assertNotIn("promql", fields)
+        self.assertNotIn("logql", fields)
+        self.assertNotIn("query", fields)
+
+    def test_plan_limits_number_of_steps(self):
+        steps = [
+            InvestigationStep(datasource=Datasource.PROMETHEUS, intent=f"step-{index}")
+            for index in range(4)
+        ]
+
+        with self.assertRaises(ValidationError):
+            InvestigationPlan(steps=steps, reason="too many")
+
+
+class QueryValidationTests(unittest.TestCase):
+    def test_mixed_logql_syntax_is_rejected_as_promql(self):
+        with self.assertRaises(ValidationError):
+            PrometheusQuery(
+                promql='service_name="payment-api" | http_requests_total'
             )
 
-        self.assertIn("PromQL에는 LogQL 파이프", json.loads(result)["error"])
-        handler.assert_not_awaited()
-
-    async def test_valid_prometheus_selector_is_accepted(self):
-        async def fake_prometheus(promql: str) -> str:
-            return promql
-
-        with patch.dict(
-            main.TOOL_HANDLERS,
-            {"query_prometheus": (main.PrometheusToolArgs, fake_prometheus)},
-        ):
-            result = await main.execute_tool(
-                "query_prometheus",
-                '{"promql":"http_requests_total{service_name=\\"payment-api\\"}"}',
-            )
+    def test_valid_prometheus_selector_is_accepted(self):
+        query = PrometheusQuery(
+            promql='http_requests_total{service_name="payment-api"}'
+        )
 
         self.assertEqual(
-            result,
+            query.promql,
             'http_requests_total{service_name="payment-api"}',
         )
 
-    async def test_tempo_trace_id_is_validated_and_normalized(self):
-        async def fake_tempo(trace_id: str) -> str:
-            return trace_id
+    def test_logql_must_start_with_stream_selector(self):
+        with self.assertRaises(ValidationError):
+            LokiQuery(logql="http_requests_total")
 
-        with patch.dict(
-            main.TOOL_HANDLERS,
-            {"query_tempo": (main.TempoToolArgs, fake_tempo)},
+    def test_tempo_trace_id_is_normalized(self):
+        query = TempoQuery(trace_id="ABCDEF0123456789ABCDEF0123456789")
+
+        self.assertEqual(query.trace_id, "abcdef0123456789abcdef0123456789")
+
+
+class ErrorDetailTests(unittest.TestCase):
+    def test_http_error_keeps_status_and_limited_response_body(self):
+        request = httpx.Request(
+            "GET",
+            "http://localhost:9090/api/v1/query",
+        )
+        response = httpx.Response(
+            400,
+            request=request,
+            text='{"status":"error","error":"parse error: unexpected pipe"}',
+        )
+        error = httpx.HTTPStatusError(
+            "bad request",
+            request=request,
+            response=response,
+        )
+
+        detail, fields = describe_exception(error)
+
+        self.assertIn("HTTP 400", detail)
+        self.assertIn("unexpected pipe", detail)
+        self.assertEqual(fields["http_status"], 400)
+        self.assertIn("unexpected pipe", fields["response_body"])
+
+
+class DatasourceErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prometheus_tool_result_keeps_400_response_detail(self):
+        request = httpx.Request(
+            "GET",
+            "http://localhost:9090/api/v1/query",
+        )
+        response = httpx.Response(
+            400,
+            request=request,
+            text='{"status":"error","error":"parse error: unexpected pipe"}',
+        )
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def get(self, url, params):
+                return response
+
+        tool = PrometheusTool(
+            "http://localhost:9090/api/v1/query",
+            timeout=5,
+            max_output_chars=2000,
+        )
+        with patch(
+            "backend.tools.prometheus.httpx.AsyncClient",
+            return_value=FakeClient(),
         ):
-            result = await main.execute_tool(
-                "query_tempo",
-                '{"trace_id":"ABCDEF0123456789ABCDEF0123456789"}',
-            )
+            result = await tool.execute("http_requests_total")
 
-        self.assertEqual(result, "abcdef0123456789abcdef0123456789")
-
-    async def test_invalid_tool_arguments_return_structured_error(self):
-        result = await main.execute_tool(
-            "query_loki",
-            '{"logql":"{service_name=\\"payment-api\\"}","limit":1001}',
-        )
-
-        self.assertIn("도구 인자 검증 실패", json.loads(result)["error"])
-
-    async def test_unknown_tool_returns_structured_error(self):
-        result = await main.execute_tool("unknown", "{}")
-
-        self.assertEqual(
-            json.loads(result),
-            {"error": "등록되지 않은 도구입니다: unknown"},
-        )
+        self.assertEqual(result.status, ResultStatus.ERROR)
+        self.assertIn("HTTP 400", result.error)
+        self.assertIn("unexpected pipe", result.error)
 
 
-class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
-    async def test_repeated_invalid_query_returns_chat_response_instead_of_500(self):
-        tool_call = SimpleNamespace(
-            id="call-invalid",
-            function=SimpleNamespace(
-                name="query_prometheus",
-                arguments=(
-                    '{"promql":"service_name=\\"payment-api\\" '
-                    '| http_requests_total"}'
-                ),
-            ),
-        )
-        invalid_message = SimpleNamespace(tool_calls=[tool_call], content=None)
-        create = AsyncMock(side_effect=[
-            SimpleNamespace(choices=[SimpleNamespace(message=invalid_message)]),
-            SimpleNamespace(choices=[SimpleNamespace(message=invalid_message)]),
-        ])
-        fake_client = SimpleNamespace(
+class PromptIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_orchestrator_outputs_high_level_plan_only(self):
+        create = AsyncMock(return_value=function_call_response(
+            "submit_investigation_plan",
+            {
+                "steps": [{
+                    "datasource": "prometheus",
+                    "intent": "payment-api 요청 상태 확인",
+                    "service": "payment-api",
+                    "time_range_minutes": 15,
+                }],
+                "reason": "메트릭 상태 질문",
+            },
+        ))
+        client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=create))
         )
+        orchestrator = Orchestrator(client, "test-model")
 
-        with patch.object(main, "client", fake_client):
-            response = await main.chat_endpoint(main.ChatRequest(message="서비스 상태"))
+        plan = await orchestrator.plan("payment-api 요청 상태를 확인해줘")
 
-        self.assertEqual(response.iterations, 2)
-        self.assertIn("동일한 데이터소스 쿼리 오류", response.reply)
-        self.assertIn("PromQL에는 LogQL 파이프", response.reply)
+        self.assertEqual(plan.steps[0].datasource, Datasource.PROMETHEUS)
+        self.assertEqual(plan.steps[0].service, "payment-api")
+        serialized = plan.model_dump_json()
+        self.assertNotIn("promql", serialized)
+        self.assertNotIn("logql", serialized)
+        self.assertNotIn("http_requests_total", orchestrator.system_prompt)
 
-    async def test_direct_answer_preserves_api_contract(self):
-        response_message = SimpleNamespace(tool_calls=None, content="정상입니다.")
+    async def test_prometheus_generator_sees_only_prometheus_metadata(self):
+        create = AsyncMock(return_value=function_call_response(
+            "submit_prometheus_query",
+            {
+                "query": 'http_requests_total{service_name="payment-api"}',
+                "purpose": "요청 수 확인",
+            },
+        ))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        generator = PrometheusQueryGenerator(
+            client,
+            "test-model",
+            load_datasource_config("prometheus"),
+        )
+
+        generated = await generator.generate(InvestigationStep(
+            datasource=Datasource.PROMETHEUS,
+            intent="요청 수 확인",
+            service="payment-api",
+        ))
+
+        self.assertEqual(generated.datasource, Datasource.PROMETHEUS)
+        self.assertNotIn("detected_level", generator.system_prompt)
+        self.assertNotIn("LogQL", generator.system_prompt)
+        create.assert_not_awaited()
+
+    async def test_loki_generator_sees_only_loki_metadata(self):
+        create = AsyncMock(return_value=function_call_response(
+            "submit_loki_query",
+            {
+                "query": '{service_name="payment-api"} | detected_level="error"',
+                "purpose": "오류 로그 확인",
+                "limit": 10,
+            },
+        ))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        generator = LokiQueryGenerator(
+            client,
+            "test-model",
+            load_datasource_config("loki"),
+        )
+
+        generated = await generator.generate(InvestigationStep(
+            datasource=Datasource.LOKI,
+            intent="오류 로그 확인",
+            service="payment-api",
+        ))
+
+        self.assertEqual(generated.datasource, Datasource.LOKI)
+        self.assertNotIn("http_requests_total", generator.system_prompt)
+        self.assertNotIn("PromQL", generator.system_prompt)
+        create.assert_not_awaited()
+
+    async def test_synthesizer_has_no_tool_access(self):
+        response_message = SimpleNamespace(tool_calls=None, content="근거 기반 답변")
         create = AsyncMock(return_value=SimpleNamespace(
             choices=[SimpleNamespace(message=response_message)]
         ))
-        fake_client = SimpleNamespace(
+        client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=create))
         )
+        synthesizer = Synthesizer(client, "test-model")
+        plan = InvestigationPlan(
+            steps=[InvestigationStep(
+                datasource=Datasource.PROMETHEUS,
+                intent="상태 확인",
+            )],
+            reason="메트릭 우선",
+        )
 
-        with patch.object(main, "client", fake_client):
+        reply = await synthesizer.synthesize("상태 확인", plan, [])
+
+        self.assertEqual(reply, "근거 기반 답변")
+        self.assertNotIn("tools", create.await_args.kwargs)
+        self.assertNotIn("tool_choice", create.await_args.kwargs)
+
+
+class WorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_workflow_runs_plan_generate_execute_synthesize(self):
+        plan = InvestigationPlan(
+            steps=[InvestigationStep(
+                datasource=Datasource.PROMETHEUS,
+                intent="요청 상태 확인",
+                service="payment-api",
+            )],
+            reason="메트릭 우선",
+        )
+        generated = GeneratedQuery(
+            datasource=Datasource.PROMETHEUS,
+            query='http_requests_total{service_name="payment-api"}',
+            purpose="요청 상태 확인",
+        )
+        result = ToolResult(
+            datasource=Datasource.PROMETHEUS,
+            query=generated.query,
+            status=ResultStatus.SUCCESS,
+            data=[{"value": 1}],
+        )
+        orchestrator = SimpleNamespace(plan=AsyncMock(return_value=plan))
+        generators = SimpleNamespace(generate=AsyncMock(return_value=generated))
+        tools = SimpleNamespace(execute=AsyncMock(return_value=result))
+        synthesizer = SimpleNamespace(synthesize=AsyncMock(return_value="정상입니다."))
+        workflow = SREWorkflow(
+            orchestrator=orchestrator,
+            generators=generators,
+            tools=tools,
+            synthesizer=synthesizer,
+            max_steps=3,
+        )
+
+        outcome = await workflow.run("상태 확인")
+
+        self.assertEqual(outcome.reply, "정상입니다.")
+        self.assertEqual(outcome.results, [result])
+        self.assertEqual(outcome.iterations, 3)
+        orchestrator.plan.assert_awaited_once()
+        generators.generate.assert_awaited_once()
+        tools.execute.assert_awaited_once_with(generated)
+        synthesizer.synthesize.assert_awaited_once()
+
+
+class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_endpoint_preserves_api_contract(self):
+        plan = InvestigationPlan(
+            steps=[InvestigationStep(
+                datasource=Datasource.PROMETHEUS,
+                intent="상태 확인",
+            )],
+            reason="메트릭 조회",
+        )
+        outcome = WorkflowOutcome(
+            reply="정상입니다.",
+            iterations=3,
+            plan=plan,
+            results=[],
+        )
+        fake_workflow = SimpleNamespace(run=AsyncMock(return_value=outcome))
+
+        with patch.object(main, "workflow", fake_workflow):
             response = await main.chat_endpoint(main.ChatRequest(message="상태 확인"))
 
-        self.assertEqual(response.query, "상태 확인")
-        self.assertEqual(response.reply, "정상입니다.")
-        self.assertEqual(response.iterations, 1)
-
-    async def test_tool_result_is_returned_to_llm(self):
-        tool_call = SimpleNamespace(
-            id="call-1",
-            function=SimpleNamespace(
-                name="query_tempo",
-                arguments='{"trace_id":"ABCDEF0123456789ABCDEF0123456789"}',
-            ),
-        )
-        tool_message = SimpleNamespace(tool_calls=[tool_call], content=None)
-        final_message = SimpleNamespace(tool_calls=None, content="트레이스 분석 완료")
-        create = AsyncMock(side_effect=[
-            SimpleNamespace(choices=[SimpleNamespace(message=tool_message)]),
-            SimpleNamespace(choices=[SimpleNamespace(message=final_message)]),
-        ])
-        fake_client = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        self.assertEqual(
+            response.model_dump(),
+            {"query": "상태 확인", "reply": "정상입니다.", "iterations": 3},
         )
 
-        async def fake_tempo(trace_id: str) -> str:
-            return json.dumps({"trace_id": trace_id})
-
-        with (
-            patch.object(main, "client", fake_client),
-            patch.dict(
-                main.TOOL_HANDLERS,
-                {"query_tempo": (main.TempoToolArgs, fake_tempo)},
-            ),
-        ):
-            response = await main.chat_endpoint(main.ChatRequest(message="트레이스 확인"))
-
-        second_call_messages = create.await_args_list[1].kwargs["messages"]
-        self.assertEqual(response.reply, "트레이스 분석 완료")
-        self.assertEqual(response.iterations, 2)
-        self.assertEqual(second_call_messages[-1]["role"], "tool")
-        self.assertIn(
-            "abcdef0123456789abcdef0123456789",
-            second_call_messages[-1]["content"],
+    async def test_http_response_echoes_request_id_for_log_correlation(self):
+        plan = InvestigationPlan(
+            steps=[InvestigationStep(
+                datasource=Datasource.PROMETHEUS,
+                intent="상태 확인",
+            )],
+            reason="메트릭 조회",
         )
+        outcome = WorkflowOutcome(
+            reply="정상입니다.",
+            iterations=3,
+            plan=plan,
+            results=[],
+        )
+        fake_workflow = SimpleNamespace(run=AsyncMock(return_value=outcome))
+        transport = httpx.ASGITransport(app=main.app)
+
+        with patch.object(main, "workflow", fake_workflow):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                response = await client.post(
+                    "/api/chat",
+                    headers={"X-Request-ID": "test-request-123"},
+                    json={"message": "상태 확인"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["X-Request-ID"], "test-request-123")
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_config_paths_are_anchored_to_backend_directory(self):
-        self.assertTrue(main.DATASOURCE_CONFIG_PATH.is_absolute())
-        self.assertTrue(main.TOOLS_CONFIG_PATH.is_absolute())
-        self.assertTrue(main.DATASOURCE_CONFIG_PATH.is_file())
-        self.assertTrue(main.TOOLS_CONFIG_PATH.is_file())
-
-    def test_prompt_uses_actual_collector_job(self):
-        prompt = main.build_system_prompt()
-
-        self.assertIn('up{job="otel-collector"}', prompt)
-        self.assertNotIn('up{job="prometheus"}', prompt)
-
-    def test_prompt_keeps_promql_and_logql_syntax_separate(self):
-        prompt = main.build_system_prompt()
-
-        self.assertIn("PromQL에는 LogQL 파이프 연산자 '|'를 절대 사용하지 않는다", prompt)
-        self.assertIn('http_requests_total{service_name="payment-api"}', prompt)
-        self.assertIn("파이프는 query_loki의 LogQL에서만 사용할 수 있다", prompt)
+    def test_role_files_exist(self):
+        for prompt in ("orchestrator", "prometheus", "loki", "tempo", "synthesizer"):
+            self.assertTrue((PROMPTS_DIR / f"{prompt}.txt").is_file())
+        for datasource in ("prometheus", "loki", "tempo"):
+            self.assertTrue((DATASOURCE_DIR / f"{datasource}.yaml").is_file())
 
 
 if __name__ == "__main__":

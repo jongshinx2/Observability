@@ -1,0 +1,10 @@
+description: Loki 로그 데이터베이스
+rules:
+  - 로그 쿼리는 중괄호 스트림 selector로 시작
+  - 파이프 뒤에는 로그 필터나 파서만 사용
+  - 기본 조회 범위는 최근 60분
+examples:
+  - intent: payment-api 전체 로그
+    query: '{service_name="payment-api"}'
+  - intent: payment-api 오류 로그
+    query: '{service_name="payment-api"} | detected_level="error"'

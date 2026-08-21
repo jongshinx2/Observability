@@ -1,0 +1,7 @@
+description: Tempo 분산 트레이싱 데이터베이스
+rules:
+  - 조회에는 정확한 32자리 hexadecimal Trace ID가 필요
+  - Trace ID가 없으면 조회를 추측하지 않음
+examples:
+  - intent: 특정 호출의 span과 오류 확인
+    trace_id: 4f2a71b0123456789abcdef012345678
