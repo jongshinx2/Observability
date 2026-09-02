@@ -1,6 +1,7 @@
 import httpx
 from pydantic import BaseModel, Field, field_validator
 
+from ..correlation.extractors.tempo import TempoCorrelationExtractor
 from ..models import Datasource, ResultStatus, ToolResult
 from ..observability import get_logger, trace_async
 from .base import compact_data, describe_exception
@@ -23,6 +24,7 @@ class TempoTool:
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.max_output_chars = max_output_chars
+        self.correlation_extractor = TempoCorrelationExtractor()
 
     @trace_async("tempo_tool")
     async def execute(self, trace_id: str) -> ToolResult:
@@ -60,6 +62,20 @@ class TempoTool:
                     status=ResultStatus.EMPTY,
                     data=None,
                 )
+            context_delta = self.correlation_extractor.extract(
+                trace_data,
+                source_query=validated.trace_id,
+            )
+            logger.info(
+                "correlation.delta.extracted",
+                extra={
+                    "event": "correlation.delta.extracted",
+                    "function_name": "TempoTool.execute",
+                    "datasource": Datasource.TEMPO.value,
+                    "pivot_count": len(context_delta.pivots),
+                    "time_window_count": len(context_delta.time_windows),
+                },
+            )
             data, truncated = compact_data(trace_data, self.max_output_chars)
             return ToolResult(
                 datasource=Datasource.TEMPO,
@@ -67,6 +83,7 @@ class TempoTool:
                 status=ResultStatus.SUCCESS,
                 data=data,
                 truncated=truncated,
+                context_delta=context_delta,
             )
         except Exception as exc:
             error_detail, error_fields = describe_exception(exc)

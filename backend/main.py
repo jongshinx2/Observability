@@ -38,13 +38,23 @@ client = AsyncOpenAI(
 orchestrator = Orchestrator(client, settings.orchestrator_model)
 generators = QueryGeneratorRegistry(client, settings)
 tool_registry = ToolRegistry(settings)
-synthesizer = Synthesizer(client, settings.synthesizer_model)
+synthesizer = Synthesizer(
+    client,
+    settings.synthesizer_model,
+    reasoning_effort=settings.synthesizer_reasoning_effort,
+    max_tokens=settings.synthesizer_max_tokens,
+)
 workflow = SREWorkflow(
     orchestrator=orchestrator,
     generators=generators,
     tools=tool_registry,
     synthesizer=synthesizer,
     max_steps=settings.max_steps,
+    correlation_max_hops=settings.correlation_max_hops,
+    correlation_buffer_seconds=settings.correlation_buffer_seconds,
+    correlation_max_trace_ids=settings.correlation_max_trace_ids,
+    correlation_max_services=settings.correlation_max_services,
+    correlation_max_span_ids=settings.correlation_max_span_ids,
 )
 
 app = FastAPI(title="SRELens Agent Local API", version="2.0.0")

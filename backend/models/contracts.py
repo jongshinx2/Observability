@@ -1,19 +1,9 @@
-from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
-
-class Datasource(str, Enum):
-    PROMETHEUS = "prometheus"
-    LOKI = "loki"
-    TEMPO = "tempo"
-
-
-class ResultStatus(str, Enum):
-    SUCCESS = "success"
-    EMPTY = "empty"
-    ERROR = "error"
+from backend.models.correlation import ContextDelta, InvestigationContext
+from backend.models.enums import Datasource, ResultStatus
 
 
 class ChatRequest(BaseModel):
@@ -66,6 +56,7 @@ class ToolResult(BaseModel):
     data: Any = None
     error: str | None = None
     truncated: bool = False
+    context_delta: ContextDelta | None = None
 
 
 class WorkflowOutcome(BaseModel):
@@ -73,3 +64,4 @@ class WorkflowOutcome(BaseModel):
     iterations: int
     plan: InvestigationPlan
     results: list[ToolResult]
+    context: InvestigationContext = Field(default_factory=InvestigationContext)

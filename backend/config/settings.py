@@ -38,6 +38,13 @@ class Settings:
     orchestrator_model: str
     query_model: str
     synthesizer_model: str
+    synthesizer_reasoning_effort: str
+    synthesizer_max_tokens: int
+    correlation_max_hops: int
+    correlation_buffer_seconds: int
+    correlation_max_trace_ids: int
+    correlation_max_services: int
+    correlation_max_span_ids: int
     prometheus_url: str
     loki_url: str
     tempo_url: str
@@ -65,6 +72,17 @@ def load_settings() -> Settings:
     if not cors_origins:
         raise RuntimeError("SRELENS_CORS_ORIGINS에 하나 이상의 origin이 필요합니다.")
 
+    synthesizer_reasoning_effort = os.getenv(
+        "SRELENS_SYNTHESIZER_REASONING_EFFORT",
+        "none",
+    ).lower()
+    if synthesizer_reasoning_effort not in {"none", "low", "medium", "high"}:
+        raise RuntimeError(
+            "SRELENS_SYNTHESIZER_REASONING_EFFORT는 "
+            "none, low, medium, high 중 하나여야 합니다: "
+            f"{synthesizer_reasoning_effort}"
+        )
+
     log_level = os.getenv("SRELENS_LOG_LEVEL", "INFO").upper()
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise RuntimeError(f"SRELENS_LOG_LEVEL이 유효하지 않습니다: {log_level}")
@@ -87,6 +105,13 @@ def load_settings() -> Settings:
         orchestrator_model=os.getenv("SRELENS_ORCHESTRATOR_MODEL", default_model),
         query_model=os.getenv("SRELENS_QUERY_MODEL", default_model),
         synthesizer_model=os.getenv("SRELENS_SYNTHESIZER_MODEL", default_model),
+        synthesizer_reasoning_effort=synthesizer_reasoning_effort,
+        synthesizer_max_tokens=_get_int("SRELENS_SYNTHESIZER_MAX_TOKENS", 512),
+        correlation_max_hops=_get_int("SRELENS_CORRELATION_MAX_HOPS", 4),
+        correlation_buffer_seconds=_get_int("SRELENS_CORRELATION_BUFFER_SECONDS", 120),
+        correlation_max_trace_ids=_get_int("SRELENS_CORRELATION_MAX_TRACE_IDS", 10),
+        correlation_max_services=_get_int("SRELENS_CORRELATION_MAX_SERVICES", 10),
+        correlation_max_span_ids=_get_int("SRELENS_CORRELATION_MAX_SPAN_IDS", 100),
         prometheus_url=os.getenv(
             "SRELENS_PROMETHEUS_URL",
             "http://localhost:9090/api/v1/query",

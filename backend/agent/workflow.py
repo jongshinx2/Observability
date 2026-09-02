@@ -1,6 +1,7 @@
 from ..agent.errors import AgentProtocolError
+from ..correlation import InvestigationContextMerger
 from ..generators import QueryGeneratorRegistry
-from ..models import ResultStatus, ToolResult, WorkflowOutcome
+from ..models import InvestigationContext, ResultStatus, ToolResult, WorkflowOutcome
 from ..tools import ToolRegistry
 from .orchestrator import Orchestrator
 from .synthesizer import Synthesizer
@@ -25,12 +26,24 @@ class SREWorkflow:
         tools: ToolRegistry,
         synthesizer: Synthesizer,
         max_steps: int,
+        correlation_max_hops: int = 4,
+        correlation_buffer_seconds: int = 120,
+        correlation_max_trace_ids: int = 10,
+        correlation_max_services: int = 10,
+        correlation_max_span_ids: int = 100,
     ):
         self.orchestrator = orchestrator
         self.generators = generators
         self.tools = tools
         self.synthesizer = synthesizer
         self.max_steps = max_steps
+        self.context_merger = InvestigationContextMerger(
+            max_hops=correlation_max_hops,
+            buffer_seconds=correlation_buffer_seconds,
+            max_trace_ids=correlation_max_trace_ids,
+            max_services=correlation_max_services,
+            max_span_ids=correlation_max_span_ids,
+        )
 
     @trace_async("workflow")
     async def run(self, question: str, user_context: str = "") -> WorkflowOutcome:
@@ -56,6 +69,7 @@ class SREWorkflow:
             },
         )
         results: list[ToolResult] = []
+        context = InvestigationContext()
         iterations = 1
 
         for step_index, step in enumerate(plan.steps[:self.max_steps], start=1):
@@ -92,6 +106,32 @@ class SREWorkflow:
                     error=f"쿼리 생성 실패: {exc}",
                 )
             results.append(result)
+            if result.query:
+                context = self.context_merger.register_query(
+                    context,
+                    result.datasource,
+                    result.query,
+                )
+            if result.context_delta is not None:
+                merge_result = self.context_merger.absorb(context, result.context_delta)
+                context = merge_result.context
+                context = self.context_merger.advance_hop(context)
+                logger.info(
+                    "correlation.context.updated",
+                    extra={
+                        "event": "correlation.context.updated",
+                        "function_name": "SREWorkflow._run",
+                        "step_index": step_index,
+                        "datasource": result.datasource.value,
+                        "added_pivots": merge_result.added_pivots,
+                        "promoted_pivots": merge_result.promoted_pivots,
+                        "added_time_windows": merge_result.added_time_windows,
+                        "total_pivots": len(context.pivots),
+                        "total_time_windows": len(context.time_windows),
+                        "visited_query_count": len(context.visited_queries),
+                        "hop_count": context.hop_count,
+                    },
+                )
             logger.info(
                 "workflow.step.completed",
                 extra={
@@ -113,4 +153,5 @@ class SREWorkflow:
             iterations=iterations,
             plan=plan,
             results=results,
+            context=context,
         )

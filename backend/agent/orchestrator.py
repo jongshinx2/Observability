@@ -11,6 +11,14 @@ from ..observability import get_logger, trace_async
 
 
 logger = get_logger("orchestrator")
+TRACE_ID_PATTERN = re.compile(r"\b[0-9a-fA-F]{32}\b")
+COMPOSITE_TRACE_KEYWORDS = (
+    "로그",
+    "메트릭",
+    "prometheus",
+    "프로메테우스",
+    "loki",
+)
 
 
 class Orchestrator:
@@ -21,6 +29,20 @@ class Orchestrator:
 
     @trace_async("orchestrator")
     async def plan(self, question: str, user_context: str = "") -> InvestigationPlan:
+        direct_plan = self._direct_trace_plan(question)
+        if direct_plan is not None:
+            logger.info(
+                "orchestrator.deterministic_route",
+                extra={
+                    "event": "orchestrator.deterministic_route",
+                    "function_name": "Orchestrator.plan",
+                    "datasource": Datasource.TEMPO.value,
+                    "trace_id": direct_plan.steps[0].trace_id,
+                    "reason": direct_plan.reason,
+                },
+            )
+            return direct_plan
+
         user_prompt = f"질문: {question}\n사용자 맥락: {user_context or '없음'}"
         try:
             arguments = await request_function_arguments(
@@ -84,6 +106,7 @@ class Orchestrator:
     def _normalize_plan(question: str, plan: InvestigationPlan) -> InvestigationPlan:
         lowered = question.lower()
         steps = plan.steps
+        trace_match = TRACE_ID_PATTERN.search(question)
 
         if "로그" in lowered and not any(
             keyword in lowered for keyword in ("메트릭", "요청량", "상태와 로그")
@@ -96,7 +119,18 @@ class Orchestrator:
         seen: set[tuple[Datasource, str, str | None]] = set()
         for step in steps:
             if step.datasource == Datasource.TEMPO and not step.trace_id:
-                continue
+                if trace_match:
+                    step.trace_id = trace_match.group(0).lower()
+                    logger.info(
+                        "orchestrator.trace_id_recovered",
+                        extra={
+                            "event": "orchestrator.trace_id_recovered",
+                            "function_name": "Orchestrator._normalize_plan",
+                            "trace_id": step.trace_id,
+                        },
+                    )
+                else:
+                    continue
             if not any(keyword in lowered for keyword in ("24시간", "하루", "어제")):
                 step.time_range_minutes = min(step.time_range_minutes, 60)
             signature = (step.datasource, step.intent, step.service)
@@ -109,9 +143,26 @@ class Orchestrator:
         return InvestigationPlan(steps=normalized_steps[:3], reason=plan.reason)
 
     @staticmethod
+    def _direct_trace_plan(question: str) -> InvestigationPlan | None:
+        trace_ids = TRACE_ID_PATTERN.findall(question)
+        lowered = question.lower()
+        if len(trace_ids) != 1 or any(
+            keyword in lowered for keyword in COMPOSITE_TRACE_KEYWORDS
+        ):
+            return None
+        return InvestigationPlan(
+            steps=[InvestigationStep(
+                datasource=Datasource.TEMPO,
+                intent="제공된 Trace ID의 호출 흐름과 오류 확인",
+                trace_id=trace_ids[0],
+            )],
+            reason="명시적 Trace ID를 감지해 Tempo로 직접 라우팅했습니다.",
+        )
+
+    @staticmethod
     def _fallback_plan(question: str) -> InvestigationPlan:
         lowered = question.lower()
-        trace_match = re.search(r"\b[0-9a-fA-F]{32}\b", question)
+        trace_match = TRACE_ID_PATTERN.search(question)
         service_match = re.search(
             r"([a-zA-Z0-9][a-zA-Z0-9_-]{1,100})(?:\s*서비스|의)",
             question,

@@ -9,6 +9,14 @@ from .contracts import (
     ToolResult,
     WorkflowOutcome,
 )
+from .correlation import (
+    ContextDelta,
+    CorrelationPivot,
+    EvidenceScope,
+    InvestigationContext,
+    PivotKind,
+    TimeWindow,
+)
 
 __all__ = [
     "ChatRequest",
@@ -20,4 +28,10 @@ __all__ = [
     "ResultStatus",
     "ToolResult",
     "WorkflowOutcome",
+    "ContextDelta",
+    "CorrelationPivot",
+    "EvidenceScope",
+    "InvestigationContext",
+    "PivotKind",
+    "TimeWindow",
 ]

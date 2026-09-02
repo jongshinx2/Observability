@@ -145,6 +145,51 @@ class DatasourceErrorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PromptIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_trace_id_bypasses_orchestrator_llm(self):
+        create = AsyncMock()
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        orchestrator = Orchestrator(client, "test-model")
+
+        plan = await orchestrator.plan(
+            "3dcede79daddf3601eed793ffe893c34 이 trace ID 에 대해 분석해줘"
+        )
+
+        self.assertEqual(plan.steps[0].datasource, Datasource.TEMPO)
+        self.assertEqual(
+            plan.steps[0].trace_id,
+            "3dcede79daddf3601eed793ffe893c34",
+        )
+        self.assertIn("직접 라우팅", plan.reason)
+        create.assert_not_awaited()
+
+    async def test_composite_trace_question_still_uses_orchestrator(self):
+        create = AsyncMock(return_value=function_call_response(
+            "submit_investigation_plan",
+            {
+                "steps": [{
+                    "datasource": "tempo",
+                    "intent": "Trace 호출 흐름 확인",
+                }],
+                "reason": "Trace와 로그를 함께 조사",
+            },
+        ))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        orchestrator = Orchestrator(client, "test-model")
+
+        plan = await orchestrator.plan(
+            "3dcede79daddf3601eed793ffe893c34 trace와 관련 로그를 분석해줘"
+        )
+
+        create.assert_awaited_once()
+        self.assertEqual(
+            plan.steps[0].trace_id,
+            "3dcede79daddf3601eed793ffe893c34",
+        )
+
     async def test_orchestrator_outputs_high_level_plan_only(self):
         create = AsyncMock(return_value=function_call_response(
             "submit_investigation_plan",
@@ -251,6 +296,110 @@ class PromptIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply, "근거 기반 답변")
         self.assertNotIn("tools", create.await_args.kwargs)
         self.assertNotIn("tool_choice", create.await_args.kwargs)
+        self.assertEqual(create.await_args.kwargs["reasoning_effort"], "none")
+        self.assertEqual(create.await_args.kwargs["max_tokens"], 512)
+
+    async def test_synthesizer_uses_tempo_fallback_when_token_limit_is_reached(self):
+        response_message = SimpleNamespace(
+            tool_calls=None,
+            content="",
+            reasoning="긴 내부 추론",
+        )
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=response_message,
+                finish_reason="length",
+            )],
+            usage=SimpleNamespace(
+                prompt_tokens=590,
+                completion_tokens=3506,
+                total_tokens=4096,
+            ),
+        )
+        create = AsyncMock(return_value=response)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        synthesizer = Synthesizer(client, "test-model")
+        trace_id = "3dcede79daddf3601eed793ffe893c34"
+        plan = InvestigationPlan(
+            steps=[InvestigationStep(
+                datasource=Datasource.TEMPO,
+                intent="Trace 분석",
+                trace_id=trace_id,
+            )],
+            reason="Tempo 직접 라우팅",
+        )
+        result = ToolResult(
+            datasource=Datasource.TEMPO,
+            query=trace_id,
+            status=ResultStatus.SUCCESS,
+            data={
+                "batches": [{
+                    "resource": {
+                        "attributes": [{
+                            "key": "service.name",
+                            "value": {"stringValue": "payment-api"},
+                        }],
+                    },
+                    "scopeSpans": [{
+                        "spans": [
+                            {
+                                "traceId": trace_id,
+                                "spanId": "1111111111111111",
+                                "name": "GET /payment",
+                                "startTimeUnixNano": "1000000000",
+                                "endTimeUnixNano": "1250000000",
+                                "status": {"code": "STATUS_CODE_OK"},
+                            },
+                            {
+                                "traceId": trace_id,
+                                "spanId": "2222222222222222",
+                                "name": "charge-card",
+                                "startTimeUnixNano": "1050000000",
+                                "endTimeUnixNano": "1200000000",
+                                "status": {"code": "STATUS_CODE_ERROR"},
+                            },
+                        ],
+                    }],
+                }],
+            },
+        )
+
+        reply = await synthesizer.synthesize("Trace 분석", plan, [result])
+
+        self.assertNotEqual(reply, "분석 결과를 생성하지 못했습니다.")
+        self.assertIn(trace_id, reply)
+        self.assertIn("payment-api", reply)
+        self.assertIn("Span 수: 2", reply)
+        self.assertIn("오류 Span 수: 1", reply)
+
+    async def test_synthesizer_uses_fallback_when_llm_times_out(self):
+        create = AsyncMock(side_effect=TimeoutError("LLM timeout"))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        synthesizer = Synthesizer(client, "test-model")
+        trace_id = "3dcede79daddf3601eed793ffe893c34"
+        plan = InvestigationPlan(
+            steps=[InvestigationStep(
+                datasource=Datasource.TEMPO,
+                intent="Trace 분석",
+                trace_id=trace_id,
+            )],
+            reason="Tempo 직접 라우팅",
+        )
+        result = ToolResult(
+            datasource=Datasource.TEMPO,
+            query=trace_id,
+            status=ResultStatus.EMPTY,
+            data=None,
+        )
+
+        reply = await synthesizer.synthesize("Trace 분석", plan, [result])
+
+        self.assertIn(trace_id, reply)
+        self.assertIn("조회 결과가 없습니다", reply)
 
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
