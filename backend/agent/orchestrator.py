@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from ..config.settings import load_prompt
 from ..models import Datasource, InvestigationPlan, InvestigationStep
+from ..llm.options import LLMRequestOptions
 from .errors import AgentProtocolError
 from .llm import request_function_arguments
 from ..observability import get_logger, trace_async
@@ -22,13 +23,16 @@ COMPOSITE_TRACE_KEYWORDS = (
 
 
 class Orchestrator:
-    def __init__(self, client: Any, model: str):
+    def __init__(self, client: Any, model: str, request_options: LLMRequestOptions | None = None):
         self.client = client
         self.model = model
+        self.request_options = request_options or LLMRequestOptions()
         self.system_prompt = load_prompt("orchestrator")
 
     @trace_async("orchestrator")
-    async def plan(self, question: str, user_context: str = "") -> InvestigationPlan:
+    async def plan(
+        self, question: str, user_context: str = "", *, allow_fallback: bool = True,
+    ) -> InvestigationPlan:
         direct_plan = self._direct_trace_plan(question)
         if direct_plan is not None:
             logger.info(
@@ -48,6 +52,7 @@ class Orchestrator:
             arguments = await request_function_arguments(
                 client=self.client,
                 model=self.model,
+                request_options=self.request_options,
                 system_prompt=self.system_prompt,
                 user_prompt=user_prompt,
                 function_name="submit_investigation_plan",
@@ -88,8 +93,10 @@ class Orchestrator:
                 },
             )
             plan = InvestigationPlan.model_validate(arguments)
-            return self._normalize_plan(question, plan)
+            return self._normalize_plan(question, plan, allow_fallback=allow_fallback)
         except (AgentProtocolError, ValidationError, ValueError) as exc:
+            if not allow_fallback:
+                raise
             logger.warning(
                 "orchestrator.fallback_applied",
                 extra={
@@ -103,7 +110,9 @@ class Orchestrator:
             return self._fallback_plan(question)
 
     @staticmethod
-    def _normalize_plan(question: str, plan: InvestigationPlan) -> InvestigationPlan:
+    def _normalize_plan(
+        question: str, plan: InvestigationPlan, *, allow_fallback: bool = True,
+    ) -> InvestigationPlan:
         lowered = question.lower()
         steps = plan.steps
         trace_match = TRACE_ID_PATTERN.search(question)
@@ -139,6 +148,8 @@ class Orchestrator:
                 seen.add(signature)
 
         if not normalized_steps:
+            if not allow_fallback:
+                raise AgentProtocolError("정규화 후 실행 가능한 조사 단계가 없습니다.")
             return Orchestrator._fallback_plan(question)
         return InvestigationPlan(steps=normalized_steps[:3], reason=plan.reason)
 

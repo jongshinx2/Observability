@@ -4,7 +4,7 @@ import re
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from openai import AsyncOpenAI, OpenAIError
+from openai import OpenAIError
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 if str(PROJECT_DIR) not in sys.path:
@@ -14,6 +14,7 @@ from backend.agent import Orchestrator, SREWorkflow, Synthesizer
 from backend.agent.errors import AgentProtocolError
 from backend.config.settings import BACKEND_DIR, Settings, load_settings
 from backend.generators import QueryGeneratorRegistry
+from backend.llm.client import create_llm_client
 from backend.models import ChatRequest, ChatResponse
 from backend.observability import (
     bind_request_id,
@@ -29,20 +30,28 @@ from backend.tools import ToolRegistry
 settings: Settings = load_settings()
 configure_logging(settings.log_level, settings.log_format, settings.log_file)
 logger = get_logger("api")
-client = AsyncOpenAI(
-    base_url=settings.ollama_base_url,
-    api_key="ollama",
-    timeout=settings.llm_timeout,
-)
+client = create_llm_client(settings)
+logger.info("llm.client.configured", extra={
+    "event": "llm.client.configured",
+    "base_url": settings.llm_base_url,
+    "auth_mode": settings.llm_auth_mode,
+    "models": [settings.orchestrator_model, settings.query_model, settings.synthesizer_model],
+    "reasoning_modes": {
+        "orchestrator": settings.orchestrator_options.reasoning_mode,
+        "query": settings.query_options.reasoning_mode,
+        "synthesizer": settings.synthesizer_options.reasoning_mode,
+    },
+    "timeout": settings.llm_timeout,
+    "max_retries": settings.llm_max_retries,
+})
 
-orchestrator = Orchestrator(client, settings.orchestrator_model)
+orchestrator = Orchestrator(client, settings.orchestrator_model, settings.orchestrator_options)
 generators = QueryGeneratorRegistry(client, settings)
 tool_registry = ToolRegistry(settings)
 synthesizer = Synthesizer(
     client,
     settings.synthesizer_model,
-    reasoning_effort=settings.synthesizer_reasoning_effort,
-    max_tokens=settings.synthesizer_max_tokens,
+    request_options=settings.synthesizer_options,
 )
 workflow = SREWorkflow(
     orchestrator=orchestrator,
@@ -119,7 +128,7 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     try:
         outcome = await workflow.run(request.message, request.user_context or "")
     except OpenAIError as exc:
-        raise HTTPException(status_code=502, detail=f"로컬 LLM 호출 실패: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"LLM 호출 실패: {exc}") from exc
     except AgentProtocolError as exc:
         raise HTTPException(status_code=422, detail=f"에이전트 구조화 출력 실패: {exc}") from exc
 

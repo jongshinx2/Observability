@@ -476,3 +476,115 @@ git diff --check
 따라서 현재 사용자가 Trace ID와 함께 Prometheus 및 Loki 정보를 요청하면 기존 계획에 포함된 조회는 실행되지만, Tempo에서 발견한 정확한 시간창과 서비스명을 사용해 누락된 데이터소스 조회를 자동 추가하는 기능은 후속 단계에서 구현해야 합니다.
 
 권장 다음 순서는 `Loki/Prometheus extractor -> 컨텍스트 기반 안전 쿼리 builder -> 제한된 자동 재조회 루프 -> 통합 분석기의 근거 범위 표기`입니다.
+
+---
+
+## 2026-09-02 LLM 연결 설정 일반화 및 vLLM 호환성 검증 기반
+
+### 진행 상태
+
+**연결 설정 일반화와 오프라인 호환성 검증을 완료했습니다. 실제 외부 vLLM 검증은 접속 정보 미제공으로 미실행 상태입니다.** 이번 변경만으로 vLLM 전환 완료 또는 특정 외부 모델의 호환성 확보를 선언하지 않습니다.
+
+### 배경 및 범위
+
+내부 Ollama에서 외부 vLLM으로 이동할 때 LLM 연결 계층만 교체하고, 기존 오케스트레이터·격리된 쿼리 생성기·통합 분석기 및 InvestigationContext를 유지하는 것이 목적입니다. OpenAI-compatible Chat Completions와 기존 named function calling 계약을 유지했습니다.
+
+이번에는 모델 선정, 프롬프트 전면 개편, 관측성 데이터소스 변경, 자동 상관분석 확대, 외부 서버 배포를 수행하지 않았습니다.
+
+### 구현 내역
+
+1. **공통 연결 설정**
+   - `SRELENS_LLM_BASE_URL`, `SRELENS_LLM_API_KEY`, `SRELENS_LLM_AUTH_MODE` 도입
+   - 기존 `SRELENS_OLLAMA_BASE_URL`과 설정 접근자 유지
+   - 공통 모델명과 역할별 모델 override 지원; 비어 있는 역할별 모델명은 공통 모델명 상속
+   - 연결 timeout, 요청 timeout, SDK 재시도 횟수 명시적 설정
+   - URL에 자격 증명·query·fragment가 들어가거나 전체 `/chat/completions` 경로를 지정하면 시작 전 거부
+   - 키가 없는 외부 서버는 무인증 사용을 명시적으로 선택해야 함
+
+2. **환경 파일 적용 경로 정리**
+   - 실행 디렉터리에 관계없이 `backend/.env` 로딩
+   - `.env.example` 자동 로딩 금지
+   - 같은 설정 키는 프로세스 환경변수 우선; URL의 신규/기존 별칭도 프로세스 설정 우선
+   - 설정 로딩 시 프로세스 환경변수를 변경하지 않음
+   - 시크릿 문자열의 `${...}` 확장을 비활성화해 원문 유지
+   - `python-dotenv==1.2.3`을 requirements에 추가하고 프로젝트 가상환경에 설치
+   - `.env` 파일을 Git에서 제외하고, 테스트 폴더 전체 제외 규칙을 제거해 신규 회귀 테스트가 누락되지 않도록 수정
+
+3. **역할별 reasoning 요청 정책**
+   - `omit`: 관련 옵션 미전송, 서버 기본 동작 사용
+   - `effort`: `reasoning_effort` 전송
+   - `chat_template`: `chat_template_kwargs.enable_thinking` 전송
+   - 글로벌 설정과 역할별 override 지원
+   - 별도 설정이 없으면 기존 정책 유지: 오케스트레이터/쿼리는 omit, 통합 분석기는 effort=none
+   - 생성 토큰 상한: 오케스트레이터 1024, 쿼리 512, 통합 분석기 512(각각 설정 가능)
+   - 서버 오류 발생 시 reasoning 옵션을 자동 변경해 재호출하지 않음
+
+4. **호출 오류와 구조화 응답 검증 보강**
+   - API 키·서버 응답 원문 대신 오류 종류와 HTTP 상태를 기록하는 안전한 LLM 오류 래퍼 도입
+   - 인증, 경로/모델, 요청 옵션, rate limit, 서버 장애, timeout 분류
+   - 빈 choices, 누락된 함수 호출, 다른 함수명, 복수 함수 호출, 잘못된 JSON, 객체가 아닌 인자, 토큰 제한 종료를 명시적으로 거부
+   - 운영 경로의 기존 결정론적 fallback은 유지
+   - 검증용 호출에서는 fallback을 금지해 연결 실패가 성공 답변처럼 보이는 현상을 차단
+
+5. **실제 서버 검증 명령 추가**
+   - `python -m backend.llm.check --live`
+   - 모델 목록 및 역할별 모델 존재 확인
+   - 실제 오케스트레이터와 Prometheus 쿼리 생성기의 named function 경로 검증
+   - 실제 통합 분석기의 최종 content 및 토큰 종료 검증
+   - reasoning 비활성화 요청과 반환된 reasoning 문자열·태그·토큰 통계 불일치 탐지
+   - 합성 데이터만 사용하며 Tempo/Loki/Prometheus 조회는 실행하지 않음
+   - SDK 재시도 0회 및 fallback 금지
+   - `--live` 없이는 네트워크 호출 없이 `not_run` 반환
+
+6. **운영 로그**
+   - `llm.client.configured`: 실제 적용 URL, 인증 모드, 역할별 모델·reasoning 모드, timeout, 재시도 설정
+   - `llm.response_received`: 함수 호출의 종료 사유, 토큰 수, content/reasoning 길이
+   - 통합 분석기 로그에 reasoning 모드와 제공되는 reasoning 토큰 통계 추가
+   - API 키 및 reasoning 원문은 신규 로그에 기록하지 않음
+
+### 검증 결과
+
+2026-09-02 실행 기준:
+
+| 검증 | 결과 |
+|---|---|
+| 변경 전 기존 테스트 | 30개 통과 |
+| 변경 후 전체 테스트 | 53개 통과(신규 23개 포함) |
+| 실제 SDK의 요청 직렬화 | httpx.MockTransport 기반 통과 |
+| omit / effort / chat_template | 함수 호출과 각 LLM 역할의 요청 필드 검증 통과 |
+| 400 / 401 / 404 / 429 / 503 / timeout | 오류 분류 및 비밀정보 미노출 검증 통과 |
+| 빈 응답·토큰 소진·비정상 함수 응답 | 실패 판정 및 fallback 분리 검증 통과 |
+| 모델 누락·인증 실패 | 생성 요청 전에 검증 중단 확인 |
+| Python 컴파일 | 통과 |
+| git diff 공백 검사 | 통과 |
+| 검증 명령의 비활성 실행 | `not_run` 확인, 서버 접속 없음 |
+| 실제 외부 vLLM 서버 | 미실행 — URL·모델명·서버 버전·인증 설정 필요 |
+
+테스트는 실제 OpenAI SDK를 사용하지만 HTTP 응답은 모의 처리합니다. 따라서 위 결과는 요청 구성·응답 처리 코드의 검증이며 외부 서버의 모델 품질, tool calling 지원, reasoning 제어 적용 또는 부하 성능을 검증한 결과가 아닙니다.
+
+### 실행 방법과 후속 조치
+
+상세 설정 및 검증 방법은 `backend/llm/README.md`에 기록했습니다.
+
+```powershell
+# 프로젝트 루트에서 회귀 테스트
+.\backend\venv\Scripts\python.exe -m unittest discover -s backend/tests -v
+
+# 외부 URL·모델명·인증·reasoning 모드를 설정한 후에만 실행
+.\backend\venv\Scripts\python.exe -m backend.llm.check --live
+```
+
+실제 vLLM 검증에는 접속 URL, `/v1/models`의 모델명, 설치된 vLLM 버전, 인증 및 chat template 설정이 필요합니다. API 키는 채팅이나 보고서에 기록하지 않고 환경변수 또는 비밀 저장소로 주입합니다.
+
+`omit`은 추론 비활성화를 의미하지 않습니다. 응답에 reasoning이 없더라도 서버가 내부 추론을 수행하지 않았다고 단정할 수 없으며, 토큰 통계가 제공되지 않으면 null로 유지합니다. 실제 서버 검증 후 그 결과를 별도 진행 이력으로 추가할 예정입니다.
+
+### 변경 파일
+
+- `backend/llm/`: 클라이언트 생성, 요청 정책, 실서버 검증 명령, 사용 문서
+- `backend/config/settings.py`, `backend/.env.example`, `backend/requirements.txt`, `.gitignore`
+- `backend/main.py`
+- `backend/agent/llm.py`, `backend/agent/orchestrator.py`, `backend/agent/synthesizer.py`
+- `backend/generators/prometheus.py`, `backend/generators/loki.py`, `backend/generators/registry.py`
+- `backend/tests/test_llm_connection.py`
+
+설계 시 [OpenAI SDK 문서](https://developers.openai.com/api/reference/python), [vLLM 함수 호출 문서](https://docs.vllm.ai/en/stable/features/tool_calling/), [vLLM reasoning 문서](https://docs.vllm.ai/en/stable/features/reasoning_outputs/)를 확인했습니다. 구체적인 옵션 적용은 최신 문서가 아니라 실제 설치 서버와 모델에서의 검증 결과를 기준으로 확정합니다.

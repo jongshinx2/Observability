@@ -5,6 +5,7 @@ import yaml
 from ..agent.llm import request_function_arguments
 from ..config.settings import load_prompt
 from ..models import Datasource, GeneratedQuery, InvestigationStep
+from ..llm.options import LLMRequestOptions
 from ..tools.loki import LokiQuery
 from ..observability import get_logger, trace_async
 
@@ -13,9 +14,13 @@ logger = get_logger("loki_generator")
 
 
 class LokiQueryGenerator:
-    def __init__(self, client: Any, model: str, datasource_config: dict):
+    def __init__(
+        self, client: Any, model: str, datasource_config: dict,
+        request_options: LLMRequestOptions | None = None,
+    ):
         self.client = client
         self.model = model
+        self.request_options = request_options or LLMRequestOptions(max_tokens=512)
         self.system_prompt = (
             f"{load_prompt('loki')}\n\n"
             f"[Loki 환경 정보]\n{yaml.safe_dump(datasource_config, allow_unicode=True)}"
@@ -45,6 +50,7 @@ class LokiQueryGenerator:
         arguments = await request_function_arguments(
             client=self.client,
             model=self.model,
+            request_options=self.request_options,
             system_prompt=self.system_prompt,
             user_prompt=step.model_dump_json(exclude_none=True),
             function_name="submit_loki_query",

@@ -4,6 +4,9 @@ from openai import OpenAIError
 
 from ..config.settings import load_prompt
 from ..models import InvestigationPlan, ToolResult
+from ..llm.client import create_completion, response_stats
+from ..llm.options import LLMRequestOptions
+from .errors import AgentProtocolError
 from ..observability import get_logger, trace_async
 from .fallback_analyzer import build_deterministic_analysis
 
@@ -18,11 +21,15 @@ class Synthesizer:
         model: str,
         reasoning_effort: str = "none",
         max_tokens: int = 512,
+        request_options: LLMRequestOptions | None = None,
     ):
         self.client = client
         self.model = model
-        self.reasoning_effort = reasoning_effort
-        self.max_tokens = max_tokens
+        self.request_options = request_options or LLMRequestOptions(
+            reasoning_mode="effort", reasoning_effort=reasoning_effort, max_tokens=max_tokens,
+        )
+        self.reasoning_effort = self.request_options.reasoning_effort
+        self.max_tokens = self.request_options.max_tokens
         self.system_prompt = load_prompt("synthesizer")
 
     @trace_async("synthesizer")
@@ -31,6 +38,8 @@ class Synthesizer:
         question: str,
         plan: InvestigationPlan,
         results: list[ToolResult],
+        *,
+        allow_fallback: bool = True,
     ) -> str:
         evidence = "\n".join(
             result.model_dump_json(exclude={"context_delta"}) for result in results
@@ -46,7 +55,8 @@ class Synthesizer:
             },
         )
         try:
-            response = await self.client.chat.completions.create(
+            response = await create_completion(
+                self.client,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": self.system_prompt},
@@ -60,10 +70,11 @@ class Synthesizer:
                     },
                 ],
                 temperature=0.2,
-                reasoning_effort=self.reasoning_effort,
-                max_tokens=self.max_tokens,
+                **self.request_options.as_kwargs(),
             )
         except (OpenAIError, TimeoutError) as exc:
+            if not allow_fallback:
+                raise
             logger.warning(
                 "synthesizer.fallback_applied",
                 extra={
@@ -72,12 +83,15 @@ class Synthesizer:
                     "fallback_reason": "llm_request_failed",
                     "error_type": type(exc).__name__,
                     "error": str(exc),
+                    "http_status": getattr(exc, "status_code", None),
+                    "error_category": getattr(exc, "category", None),
                 },
                 exc_info=True,
             )
             return build_deterministic_analysis(results)
 
-        choice = response.choices[0] if response.choices else None
+        choices = getattr(response, "choices", None) or []
+        choice = choices[0] if choices else None
         message = getattr(choice, "message", None)
         content = getattr(message, "content", "") if message is not None else ""
         content = content.strip() if isinstance(content, str) else ""
@@ -102,9 +116,13 @@ class Synthesizer:
                 "total_tokens": getattr(usage, "total_tokens", None),
                 "content_chars": len(content),
                 "reasoning_chars": len(str(reasoning)),
+                "reasoning_mode": self.request_options.reasoning_mode,
+                "reasoning_tokens": response_stats(response)["reasoning_tokens"],
             },
         )
         if not content or finish_reason == "length":
+            if not allow_fallback:
+                raise AgentProtocolError("통합 분석 응답이 비어 있거나 토큰 제한으로 중단됐습니다.")
             fallback_reason = "token_limit" if finish_reason == "length" else "empty_content"
             logger.warning(
                 "synthesizer.fallback_applied",

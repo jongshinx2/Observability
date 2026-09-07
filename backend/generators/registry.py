@@ -15,11 +15,13 @@ class QueryGeneratorRegistry:
                 client,
                 settings.query_model,
                 load_datasource_config("prometheus"),
+                request_options=settings.query_options,
             ),
             Datasource.LOKI: LokiQueryGenerator(
                 client,
                 settings.query_model,
                 load_datasource_config("loki"),
+                request_options=settings.query_options,
             ),
             Datasource.TEMPO: TempoQueryGenerator(),
         }
